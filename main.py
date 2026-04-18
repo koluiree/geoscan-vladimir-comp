@@ -1,13 +1,16 @@
 import sys
 import time
+
+import numpy as np
 import path_finder
 from PioneerControl import PioneerControl  # ИЗМЕНЕНИЕ
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
-import numpy as np
 
 FLIGHT_ALTITUDE = 0.1  # Увеличим высоту для безопасности
 FLIGHT_SPEED = 2.0     # Скорость полета 1 м/с
+ZONE_PENALTY_PER_SECOND = 1.0
+OUTSIDE_PENALTY_PER_SECOND = 12.0
 
 def fly_mission(pioneer: PioneerControl, waypoints: list):
     print("Дрон подключен. Начинаем миссию.")
@@ -46,7 +49,7 @@ def main():
     try:
         with open(zones_file, "r", encoding="utf-8") as f:
             text = f.read()
-        start, finish, zones_pts = path_finder.parse_data(text)
+        start, finishes, zones_pts = path_finder.parse_data(text)
     except FileNotFoundError:
         print(f"Ошибка: Файл с зонами не найден по пути: {zones_file}")
         sys.exit(1)
@@ -55,29 +58,51 @@ def main():
         sys.exit(1)
 
     res = 0.6
-    safety_distance = 0.3
 
-    all_x = [start[0], finish[0]] + [x for poly in zones_pts for (x, y) in poly]
-    all_y = [start[1], finish[1]] + [y for poly in zones_pts for (x, y) in poly]
+    all_x = [start[0]] + [finish[0] for finish in finishes] + [
+        x for poly in zones_pts for (x, y) in poly
+    ]
+    all_y = [start[1]] + [finish[1] for finish in finishes] + [
+        y for poly in zones_pts for (x, y) in poly
+    ]
     min_x, max_x = min(all_x) - 1.0, max(all_x) + 1.0
     min_y, max_y = min(all_y) - 1.0, max(all_y) + 1.0
 
     shapely_polys = [Polygon(poly) for poly in zones_pts if len(poly) >= 3]
-    zones_union = unary_union(shapely_polys) if shapely_polys else Polygon()
-    buffered_zones_union = zones_union.buffer(safety_distance)
+    permitted_zones_union = unary_union(shapely_polys) if shapely_polys else Polygon()
 
     xs = np.arange(min_x, max_x + 1e-9, res)
     ys = np.arange(min_y, max_y + 1e-9, res)
     width, height = len(xs), len(ys)
 
-    print("Запускаем поиск пути A*...")
-    path = path_finder.astar_grid(start, finish, min_x, min_y, res, xs, ys, width, height, buffered_zones_union)
+    print("Запускаем поиск лучшего пути A*...")
+    best_result = path_finder.find_best_path(
+        start,
+        finishes,
+        min_x,
+        min_y,
+        res,
+        xs,
+        ys,
+        width,
+        height,
+        permitted_zones_union,
+        flight_speed=FLIGHT_SPEED,
+        cost_inside_zone_per_second=ZONE_PENALTY_PER_SECOND,
+        cost_outside_zone_per_second=OUTSIDE_PENALTY_PER_SECOND,
+    )
 
-    if path is None:
+    if best_result is None:
         print("Путь не найден! Проверьте параметры или расположение зон.")
         sys.exit(1)
 
-    simplified_path = path_finder.simplify_path(path, buffered_zones_union)
+    finish_index, best_finish, path, total_penalty = best_result
+    simplified_path = path_finder.simplify_path(path)
+
+    print(
+        f"Выбран финиш #{finish_index}: X={best_finish[0]:.3f}, Y={best_finish[1]:.3f}, "
+        f"ожидаемый штраф={total_penalty:.3f}"
+    )
     
     print("\nУпрощённый путь (точки для дрона):")
     for p in simplified_path:
