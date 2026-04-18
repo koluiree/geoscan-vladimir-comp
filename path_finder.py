@@ -44,10 +44,7 @@ def parse_data(text):
         if len(point_lines) != point_count:
             raise ValueError("Несовпадение количества строк с точками")
 
-        points = [
-            _parse_point_line(point_line, "точки")
-            for point_line in point_lines
-        ]
+        points = [_parse_point_line(point_line, "точки") for point_line in point_lines]
         start = points[0]
         finishes = points[1:]
 
@@ -70,8 +67,7 @@ def parse_data(text):
             if len(finish_lines) != finish_count:
                 raise ValueError("Несовпадение количества финишей")
             finishes = [
-                _parse_point_line(finish_line, "финиша")
-                for finish_line in finish_lines
+                _parse_point_line(finish_line, "финиша") for finish_line in finish_lines
             ]
             line_index += finish_count
         elif len(second_parts) == 2:
@@ -198,7 +194,8 @@ def astar_grid_with_cost(
 
     def heuristic(coord):
         return (
-            math.hypot(goal[0] - coord[0], goal[1] - coord[1]) / flight_speed
+            math.hypot(goal[0] - coord[0], goal[1] - coord[1])
+            / flight_speed
             * min_penalty_per_second
         )
 
@@ -464,9 +461,7 @@ def plot_result(
     ax.legend(unique.values(), unique.keys())
     plt.xlabel("X")
     plt.ylabel("Y")
-    plt.title(
-        "Прокладка пути по разрешённым зонам (A*, res = {:.3f})".format(res)
-    )
+    plt.title("Прокладка пути по разрешённым зонам (A*, res = {:.3f})".format(res))
     plt.show()
 
 
@@ -487,12 +482,16 @@ def main():
     cost_inside_zone_per_second = 1.0
     cost_outside_zone_per_second = 12.0
 
-    all_x = [start[0]] + [goal[0] for goal in goals] + [
-        x for poly in zones_pts for (x, y) in poly
-    ]
-    all_y = [start[1]] + [goal[1] for goal in goals] + [
-        y for poly in zones_pts for (x, y) in poly
-    ]
+    all_x = (
+        [start[0]]
+        + [goal[0] for goal in goals]
+        + [x for poly in zones_pts for (x, y) in poly]
+    )
+    all_y = (
+        [start[1]]
+        + [goal[1] for goal in goals]
+        + [y for poly in zones_pts for (x, y) in poly]
+    )
     min_x = min(all_x) - 1.0
     max_x = max(all_x) + 1.0
     min_y = min(all_y) - 1.0
