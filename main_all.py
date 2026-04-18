@@ -1,303 +1,148 @@
-import logging
-import math
-import threading
+import sys
 import time
 
-from pioneer_sdk import Pioneer
+import numpy as np
+from shapely.geometry import Polygon
+from shapely.ops import unary_union
+
+FLIGHT_ALTITUDE = 0.1  # Увеличим высоту для безопасности
+FLIGHT_SPEED = 7.0
+ZONE_PENALTY_PER_SECOND = 1.0
+OUTSIDE_PENALTY_PER_SECOND = 12.0
+ZONE_FULL_CROSS_MARGIN = 0.25
 
 
-class PioneerControl:
-    def __init__(self, ip_addr, pioneer_port):
-        logging.basicConfig(
-            level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+def fly_mission(pioneer: PioneerControl, waypoints: list):
+    print("Дрон подключен. Начинаем миссию.")
+    pioneer.arm()
+    pioneer.takeoff()
+
+    for i, point in enumerate(waypoints):
+        x, y = point
+        print(
+            f"\nОтправка на точку #{i + 1}: X={x:.2f}, Y={y:.2f} со скоростью {FLIGHT_SPEED} м/с"
         )
-        self.logger = logging.getLogger(__name__)
-
-        self.pioneer: Pioneer | None = None
-        self.target_speed = 0  # для управления скоростью в функции __compute_speed
-        self.low_distance = False
-
-        self.__current_pos: tuple[float, float, float] = (
-            0.0,
-            0.0,
-            0.0,
-        )  # последняя полученная позиция дрона
-        self.__command_pos: tuple[int] | None = None  # позиция для команды
-        self.__yaw: float = 0.0  # рысканье
-        self.__yaw_rate: float = 0.0  # скорость поворота рысканья
-        self.__speed: tuple[float] = (0.0, 0.0, 0.0)  # задание скоростей по x, y, z
-        self.__coords_system: str = (
-            "GLOBAL_COORDS"  # GLOBAL_COORDS / SPEED / SPEED_FIXED / SPEED_POINT
+        pioneer.set_point_with_speed(
+            target_x=x, target_y=y, target_z=FLIGHT_ALTITUDE, speed=FLIGHT_SPEED
         )
-        self.__armed: bool = False
-        self.__takeoffed: bool = False
-        self.__target_yaw: int | None = None
 
-        self.__connect(ip_addr=str(ip_addr), port=int(pioneer_port))
-
-        # --- Изменения для корректного завершения ---
-        self.__stop_event = threading.Event()
-        self.__command_thread = threading.Thread(
-            target=self.__command_loop, daemon=True
-        )
-        self.__command_thread.start()
-
-    def __command_loop(self):
-        self.logger.info("Command loop started")
-        prev_cmd = None
-        # --- Цикл теперь проверяет событие остановки ---
-        while not self.__stop_event.is_set():
-            if not self.pioneer.connected():
-                self.logger.error("PIONEER NOT CONNECTED")
-                time.sleep(1)  # Пауза перед новой попыткой
-                continue
-
-            if self.__coords_system == "GLOBAL_COORDS":
-                if self.__command_pos is not None and self.__armed and self.__takeoffed:
-                    if prev_cmd != self.__command_pos:
-                        self.pioneer.go_to_local_point(
-                            x=self.__command_pos[0],
-                            y=self.__command_pos[1],
-                            z=self.__command_pos[2],
-                            yaw=self.__yaw,
-                        )
-                        self.logger.info(f"Command sent {self.__command_pos}")
-                        prev_cmd = self.__command_pos
-            elif self.__coords_system == "SPEED":
-                if self.__armed and self.__takeoffed:
-                    if prev_cmd != (*self.__speed, self.__yaw_rate):
-                        self.pioneer.set_manual_speed(
-                            vx=self.__speed[0],
-                            vy=self.__speed[1],
-                            vz=self.__speed[2],
-                            yaw_rate=self.__yaw_rate,
-                        )
-                        self.logger.info(
-                            f"Command sent {self.__speed}, yaw_rate: {self.__yaw_rate}"
-                        )
-                        prev_cmd = (*self.__speed, self.__yaw_rate)
-            elif self.__coords_system == "SPEED_FIXED":
-                if self.__armed and self.__takeoffed:
-                    if self.__target_yaw is not None and self.__is_yaw_reached():
-                        self.__target_yaw = None
-                        self.__yaw_rate = 0
-                    if prev_cmd != (*self.__speed, self.__yaw_rate):
-                        self.pioneer.set_manual_speed_body_fixed(
-                            vx=self.__speed[0],
-                            vy=self.__speed[1],
-                            vz=self.__speed[2],
-                            yaw_rate=self.__yaw_rate,
-                        )
-                        self.logger.info(
-                            f"Command sent {self.__speed}, yaw_rate: {self.__yaw_rate}"
-                        )
-                        prev_cmd = (*self.__speed, self.__yaw_rate)
-            elif self.__coords_system == "SPEED_POINT":
-                if self.__command_pos is not None:
-                    self.__speed = self.__compute_speed(
-                        *self.__command_pos, wanted_speed=self.target_speed
-                    )
-                if self.__armed and self.__takeoffed:
-                    self.pioneer.set_manual_speed_body_fixed(
-                        vx=self.__speed[0],
-                        vy=self.__speed[1],
-                        vz=self.__speed[2],
-                        yaw_rate=self.__yaw_rate,
-                    )
-
-            self.__update_position()
-            # self.__update_yaw()
-            time.sleep(0.05)
-        self.logger.info("Command loop stopped.")
-
-    def stop(self):
-        """Останавливает поток управления и отключается от дрона."""
-        self.logger.info("Stopping...")
-        self.__stop_event.set()
-        self.__command_thread.join()  # Ожидаем завершения потока
-        if self.pioneer and self.pioneer.connected():
-            self.pioneer.close()  # Закрываем соединение
-            self.logger.info("Pioneer connection closed.")
-
-    def __connect(self, ip_addr, port: str):
-        """Подключение к пионеру"""
-        try:
-            self.pioneer = Pioneer(ip=ip_addr, mavlink_port=port, logger=False)
-            if self.pioneer.connected():
-                self.logger.info("Pioneer connected!")
-            else:
-                self.logger.warning("Can't connect to Pioneer!")
-        except Exception as e:
-            self.logger.error(f"Failed to connect to Pioneer: {e}")
-
-    def __is_yaw_reached(self, dead_zone: int = 10) -> bool:
-        if self.__coords_system == "SPEED_FIXED" and self.__target_yaw is not None:
-            return abs(math.degrees(self.__yaw) - self.__target_yaw) < dead_zone
-        return False
-
-    def __is_point_reached(self, dead_zone: float = 0.7) -> bool:
-        """Проверка на расстояние до точки"""
-        if self.__command_pos is None:
-            return False
-        if self.__coords_system in ("GLOBAL_COORDS", "SPEED_POINT"):
-            if self.__current_pos:
-                distance = math.sqrt(
-                    (self.__current_pos[0] - self.__command_pos[0]) ** 2
-                    + (self.__current_pos[1] - self.__command_pos[1]) ** 2
-                    + (self.__current_pos[2] - self.__command_pos[2]) ** 2
+        while not pioneer.point_reached():
+            current_pos = pioneer.get_local_pose()
+            if current_pos:
+                print(
+                    f"\rТекущая позиция: X={current_pos[0]:.2f}, Y={current_pos[1]:.2f}, Z={current_pos[2]:.2f}",
+                    end="",
                 )
-                return distance < dead_zone
-            return False
+            time.sleep(0.05)
+
+        print(f"\nТочка #{i + 1} достигнута.")
+        time.sleep(0.05)
+
+    print("\nВсе точки пройдены. Посадка...")
+    pioneer.land()
+
+    return True
+
+
+def main():
+    if len(sys.argv) < 4:
+        print("Использование: python main.py <ip> <port> <zones_file>")
+        sys.exit(1)
+
+    ip = sys.argv[1]
+    port = int(sys.argv[2])
+    zones_file = sys.argv[3]
+
+    try:
+        with open(zones_file, "r", encoding="utf-8") as f:
+            text = f.read()
+        start, finishes, zones_pts = path_finder.parse_data(text)
+    except FileNotFoundError:
+        print(f"Ошибка: Файл с зонами не найден по пути: {zones_file}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Ошибка при чтении или парсинге файла с зонами: {e}")
+        sys.exit(1)
+
+    res = 0.6
+
+    all_x = (
+        [start[0]]
+        + [finish[0] for finish in finishes]
+        + [x for poly in zones_pts for (x, y) in poly]
+    )
+    all_y = (
+        [start[1]]
+        + [finish[1] for finish in finishes]
+        + [y for poly in zones_pts for (x, y) in poly]
+    )
+    min_x, max_x = min(all_x) - 1.0, max(all_x) + 1.0
+    min_y, max_y = min(all_y) - 1.0, max(all_y) + 1.0
+
+    shapely_polys = [Polygon(poly) for poly in zones_pts if len(poly) >= 3]
+    permitted_zones_union = unary_union(shapely_polys) if shapely_polys else Polygon()
+    effective_permitted_zones_union = (
+        permitted_zones_union.buffer(ZONE_FULL_CROSS_MARGIN, join_style=2)
+        if ZONE_FULL_CROSS_MARGIN > 0
+        else permitted_zones_union
+    )
+
+    xs = np.arange(min_x, max_x + 1e-9, res)
+    ys = np.arange(min_y, max_y + 1e-9, res)
+    width, height = len(xs), len(ys)
+
+    print("Запускаем поиск лучшего пути A*...")
+    best_result = path_finder.find_best_path(
+        start,
+        finishes,
+        min_x,
+        min_y,
+        res,
+        xs,
+        ys,
+        width,
+        height,
+        effective_permitted_zones_union,
+        flight_speed=FLIGHT_SPEED,
+        cost_inside_zone_per_second=ZONE_PENALTY_PER_SECOND,
+        cost_outside_zone_per_second=OUTSIDE_PENALTY_PER_SECOND,
+    )
+
+    if best_result is None:
+        print("Путь не найден! Проверьте параметры или расположение зон.")
+        sys.exit(1)
+
+    finish_index, best_finish, optimized_path, total_penalty = best_result
+
+    print(
+        f"Выбран финиш #{finish_index}: X={best_finish[0]:.3f}, Y={best_finish[1]:.3f}, "
+        f"ожидаемый штраф={total_penalty:.3f}"
+    )
+
+    print("\nОптимизированный путь (точки для дрона):")
+    for p in optimized_path:
+        print(f"X: {p[0]:.3f}, Y: {p[1]:.3f}")
+    pioneer_drone = PioneerControl(ip_addr=ip, pioneer_port=port)
+    time.sleep(0.3)
+
+    try:
+        success = fly_mission(pioneer_drone, optimized_path)
+        if success:
+            print("\nМиссия успешно завершена!")
         else:
-            self.logger.warning(
-                "Can't check if point is reached in current coordinate system"
-            )
-            return True
+            print("\nМиссия прервана из-за ошибки.")
+    except Exception as e:
+        print(f"\nПроизошла критическая ошибка во время полета: {e}")
 
-    # def __update_yaw(self):
-    #     yaw = self.pioneer.get_yaw(get_last_received=True)
-    #     if yaw is not None:
-    #         self.__yaw = yaw
 
-    def __update_position(self):
-        pos = self.pioneer.get_local_position_lps(get_last_received=True)
-        if pos is not None:
-            self.__current_pos = pos
-
-    def __compute_speed(
-        self, target_x: float, target_y: float, target_z: float, wanted_speed: float
-    ) -> tuple[float, float, float]:
-        """Вычисляет скорость, с которой дрону нужно лететь по x, y, z чтобы добраться до точки"""
-        if self.__current_pos is None or self.__command_pos is None:
-            return 0.0, 0.0, 0.0
-
-        diff_x = target_x - self.__current_pos[0]
-        diff_y = target_y - self.__current_pos[1]
-        diff_z = target_z - self.__current_pos[2]
-
-        distance = math.sqrt(diff_x**2 + diff_y**2 + diff_z**2)
-
-        if distance < 0.05:  # Если мы уже в точке, скорость равна нулю
-            return 0.0, 0.0, 0.0
-
-        diff_sum = abs(diff_x) + abs(diff_y) + abs(diff_z)
-        if diff_sum == 0:
-            return 0.0, 0.0, 0.0
-
-        speed_coeff_x = diff_x / diff_sum
-        speed_coeff_y = diff_y / diff_sum
-        speed_coeff_z = diff_z / diff_sum
-
-        # Плавное замедление при приближении к цели
-        current_speed = wanted_speed
-        if distance < 2:  # Начало зоны замедления
-            current_speed = max(
-                1, wanted_speed * (distance / 2)
-            )  # Минимальная скорость 0.2 м/с
-
-        vx = current_speed * speed_coeff_x
-        vy = current_speed * speed_coeff_y
-        vz = current_speed * speed_coeff_z
-
-        return vx, vy, vz
-
-    def point_reached(self):
-        if self.pioneer.connected():
-            return self.__is_point_reached()
-        else:
-            self.logger.error("PIONEER NOT CONNECTED FOR POINT REACHED")
-            return False
-
-    def set_local_pose(self, x, y, z, yaw=None):
-        """Ставит координаты для command_loop, yaw задается в градусах"""
-        self.__coords_system = "GLOBAL_COORDS"
-        self.__yaw_rate = 0.0
-        self.__speed = (0.0, 0.0, 0.0)
-        self.__command_pos = (x, y, z)
-        if yaw is not None:
-            self.__yaw = math.radians(yaw)
-        self.logger.info(f"Coords set: {self.__command_pos}, yaw: {self.__yaw}")
-
-    def set_speed(self, vx, vy, vz, yaw_rate=None):
-        """Устанавливает скорость в глобальной системе координат"""
-        self.__coords_system = "SPEED"
-        self.__command_pos = None
-        self.__speed = (vx, vy, vz)
-        if yaw_rate is not None:
-            self.__yaw_rate = math.radians(yaw_rate)
-        self.logger.info(f"Speed set: {self.__speed}, yaw rate: {self.__yaw_rate}")
-
-    def set_point_with_speed(self, target_x, target_y, target_z, speed):
-        """Лететь к точке с заданной скоростью в связанной с телом системе координат"""
-        self.__coords_system = "SPEED_POINT"
-        self.__command_pos = (target_x, target_y, target_z)
-        self.target_speed = speed
-
-    def set_speed_fixed(self, vx, vy, vz, yaw_rate=None):
-        """Устанавливает скорость в связанной с телом системе координат"""
-        self.__coords_system = "SPEED_FIXED"
-        self.__command_pos = None
-        self.__speed = (vx, vy, vz)
-        if yaw_rate is not None:
-            self.__yaw_rate = math.radians(yaw_rate)
-        self.logger.info(
-            f"<<FIXED>> Speed set: {self.__speed}, yaw rate: {self.__yaw_rate}"
-        )
-
-    def get_local_pose(self):
-        return self.__current_pos
-
-    def get_yaw(self, degrees=False):
-        return math.degrees(self.__yaw) if degrees else self.__yaw
-
-    def arm(self):
-        if self.pioneer.connected():
-            self.pioneer.arm()
-            self.__armed = True
-            self.logger.info("ARMED")
-        else:
-            self.logger.error("PIONEER NOT CONNECTED FOR ARM")
-
-    def takeoff(self):
-        if self.pioneer.connected():
-            self.pioneer.takeoff()
-            self.__takeoffed = True
-            self.logger.info("TAKEOFF")
-        else:
-            self.logger.error("PIONEER NOT CONNECTED FOR TAKEOFF")
-
-    def connection(self):
-        return self.pioneer and self.pioneer.connected()
-
-    def land(self):
-        if self.pioneer.connected():
-            if self.__takeoffed:
-                self.__command_pos = None
-                self.__speed = (0.0, 0.0, 0.0)
-                self.__yaw_rate = 0.0
-                self.pioneer.land()
-                self.__takeoffed = False
-                self.__armed = False
-                self.logger.info("LANDING")
-            else:
-                self.logger.warning("PIONEER NOT TAKEOFF FOR LANDING")
-        else:
-            self.logger.error("PIONEER NOT CONNECTED FOR LANDING")
-
-    def set_yaw(self, yaw, yaw_rate=30):
-        if self.__coords_system == "SPEED_FIXED":
-            self.__target_yaw = yaw
-            self.__yaw_rate = math.radians(
-                yaw_rate if self.get_yaw(degrees=True) < yaw else -yaw_rate
-            )
-            self.logger.info(f"Set yaw: {yaw} with rate: {yaw_rate}")
+if __name__ == "__main__":
+    main()
 
 
 import heapq
+import math
 
-import numpy as np
-from shapely.geometry import LineString, Polygon
-from shapely.ops import unary_union
+from shapely.geometry import LineString
 
 try:
     import matplotlib.pyplot as plt
@@ -305,6 +150,25 @@ try:
 except ModuleNotFoundError:
     plt = None
     MplPolygon = None
+
+
+def _edge_cache_key(
+    a,
+    b,
+    permitted_zones_union,
+    flight_speed,
+    cost_inside_zone_per_second,
+    cost_outside_zone_per_second,
+):
+    left, right = (a, b) if a <= b else (b, a)
+    return (
+        left,
+        right,
+        id(permitted_zones_union),
+        flight_speed,
+        cost_inside_zone_per_second,
+        cost_outside_zone_per_second,
+    )
 
 
 def _parse_point_line(line, label):
@@ -418,7 +282,21 @@ def edge_cost(
     flight_speed=1.0,
     cost_inside_zone_per_second=1.0,
     cost_outside_zone_per_second=12.0,
+    edge_cost_cache=None,
 ):
+    cache_key = None
+    if edge_cost_cache is not None:
+        cache_key = _edge_cache_key(
+            a,
+            b,
+            permitted_zones_union,
+            flight_speed,
+            cost_inside_zone_per_second,
+            cost_outside_zone_per_second,
+        )
+        if cache_key in edge_cost_cache:
+            return edge_cost_cache[cache_key]
+
     line = LineString([a, b])
     total_len = line.length
     if total_len == 0:
@@ -433,9 +311,38 @@ def edge_cost(
 
     time_in_zone = len_in_zone / flight_speed
     time_out_zone = len_out / flight_speed
-    return (
+    cost = (
         time_in_zone * cost_inside_zone_per_second
         + time_out_zone * cost_outside_zone_per_second
+    )
+
+    if cache_key is not None:
+        edge_cost_cache[cache_key] = cost
+
+    return cost
+
+
+def path_cost(
+    path,
+    permitted_zones_union,
+    flight_speed=1.0,
+    cost_inside_zone_per_second=1.0,
+    cost_outside_zone_per_second=12.0,
+    edge_cost_cache=None,
+):
+    if not path or len(path) < 2:
+        return 0.0
+    return sum(
+        edge_cost(
+            path[i - 1],
+            path[i],
+            permitted_zones_union,
+            flight_speed=flight_speed,
+            cost_inside_zone_per_second=cost_inside_zone_per_second,
+            cost_outside_zone_per_second=cost_outside_zone_per_second,
+            edge_cost_cache=edge_cost_cache,
+        )
+        for i in range(1, len(path))
     )
 
 
@@ -453,6 +360,7 @@ def astar_grid_with_cost(
     flight_speed=1.0,
     cost_inside_zone_per_second=1.0,
     cost_outside_zone_per_second=12.0,
+    edge_cost_cache=None,
 ):
     sx = (start[0] - min_x) / res
     sy = (start[1] - min_y) / res
@@ -480,6 +388,7 @@ def astar_grid_with_cost(
             flight_speed=flight_speed,
             cost_inside_zone_per_second=cost_inside_zone_per_second,
             cost_outside_zone_per_second=cost_outside_zone_per_second,
+            edge_cost_cache=edge_cost_cache,
         )
 
     min_penalty_per_second = min(
@@ -501,10 +410,12 @@ def astar_grid_with_cost(
         flight_speed=flight_speed,
         cost_inside_zone_per_second=cost_inside_zone_per_second,
         cost_outside_zone_per_second=cost_outside_zone_per_second,
+        edge_cost_cache=edge_cost_cache,
     )
     heapq.heappush(open_heap, (start_cost + heuristic(start_coord), start_idx))
     g_score = {start_idx: start_cost}
     came_from = {}
+    closed_nodes = set()
 
     neighbor_offsets = [
         (-1, -1),
@@ -519,6 +430,16 @@ def astar_grid_with_cost(
 
     while open_heap:
         f, current = heapq.heappop(open_heap)
+        if current in closed_nodes:
+            continue
+
+        current_coord = grid_index_to_coord(current[0], current[1], min_x, min_y, res)
+        expected_f = g_score[current] + heuristic(current_coord)
+        if f > expected_f + 1e-9:
+            continue
+
+        closed_nodes.add(current)
+
         if current == goal_idx:
             path = []
             cur = current
@@ -546,12 +467,16 @@ def astar_grid_with_cost(
                 flight_speed=flight_speed,
                 cost_inside_zone_per_second=cost_inside_zone_per_second,
                 cost_outside_zone_per_second=cost_outside_zone_per_second,
+                edge_cost_cache=edge_cost_cache,
             )
             return path, total_cost
 
         for dx, dy in neighbor_offsets:
             nx, ny = current[0] + dx, current[1] + dy
             if not in_bounds(nx, ny):
+                continue
+            neighbor = (nx, ny)
+            if neighbor in closed_nodes:
                 continue
             a = grid_index_to_coord(current[0], current[1], min_x, min_y, res)
             b = grid_index_to_coord(nx, ny, min_x, min_y, res)
@@ -562,8 +487,8 @@ def astar_grid_with_cost(
                 flight_speed=flight_speed,
                 cost_inside_zone_per_second=cost_inside_zone_per_second,
                 cost_outside_zone_per_second=cost_outside_zone_per_second,
+                edge_cost_cache=edge_cost_cache,
             )
-            neighbor = (nx, ny)
             if neighbor not in g_score or tentative_g < g_score[neighbor]:
                 g_score[neighbor] = tentative_g
                 nb_coord = grid_index_to_coord(nx, ny, min_x, min_y, res)
@@ -588,6 +513,7 @@ def astar_grid(
     flight_speed=1.0,
     cost_inside_zone_per_second=1.0,
     cost_outside_zone_per_second=12.0,
+    edge_cost_cache=None,
 ):
     path, _ = astar_grid_with_cost(
         start,
@@ -603,6 +529,7 @@ def astar_grid(
         flight_speed=flight_speed,
         cost_inside_zone_per_second=cost_inside_zone_per_second,
         cost_outside_zone_per_second=cost_outside_zone_per_second,
+        edge_cost_cache=edge_cost_cache,
     )
     return path
 
@@ -616,57 +543,7 @@ def path_distance(path):
     )
 
 
-def find_best_path(
-    start,
-    goals,
-    min_x,
-    min_y,
-    res,
-    xs,
-    ys,
-    width,
-    height,
-    permitted_zones_union,
-    flight_speed=1.0,
-    cost_inside_zone_per_second=1.0,
-    cost_outside_zone_per_second=12.0,
-):
-    best_result = None
-
-    for goal_index, goal in enumerate(goals, start=1):
-        path, total_cost = astar_grid_with_cost(
-            start,
-            goal,
-            min_x,
-            min_y,
-            res,
-            xs,
-            ys,
-            width,
-            height,
-            permitted_zones_union,
-            flight_speed=flight_speed,
-            cost_inside_zone_per_second=cost_inside_zone_per_second,
-            cost_outside_zone_per_second=cost_outside_zone_per_second,
-        )
-        if path is None:
-            continue
-
-        if best_result is None:
-            best_result = (goal_index, goal, path, total_cost)
-            continue
-
-        _, _, best_path, best_cost = best_result
-        same_cost = math.isclose(total_cost, best_cost, rel_tol=1e-9, abs_tol=1e-9)
-        if total_cost < best_cost or (
-            same_cost and path_distance(path) < path_distance(best_path)
-        ):
-            best_result = (goal_index, goal, path, total_cost)
-
-    return best_result
-
-
-def simplify_path(path, tol=1e-9):
+def _simplify_collinear_path(path, tol=1e-9):
     if not path or len(path) < 3:
         return path[:]
 
@@ -696,6 +573,129 @@ def simplify_path(path, tol=1e-9):
         simplified.append(path[-1])
 
     return simplified
+
+
+def find_best_path(
+    start,
+    goals,
+    min_x,
+    min_y,
+    res,
+    xs,
+    ys,
+    width,
+    height,
+    permitted_zones_union,
+    flight_speed=1.0,
+    cost_inside_zone_per_second=1.0,
+    cost_outside_zone_per_second=12.0,
+):
+    best_result = None
+    shared_edge_cost_cache = {}
+
+    for goal_index, goal in enumerate(goals, start=1):
+        path, _ = astar_grid_with_cost(
+            start,
+            goal,
+            min_x,
+            min_y,
+            res,
+            xs,
+            ys,
+            width,
+            height,
+            permitted_zones_union,
+            flight_speed=flight_speed,
+            cost_inside_zone_per_second=cost_inside_zone_per_second,
+            cost_outside_zone_per_second=cost_outside_zone_per_second,
+            edge_cost_cache=shared_edge_cost_cache,
+        )
+        if path is None:
+            continue
+
+        optimized_path = simplify_path(
+            path,
+            permitted_zones_union=permitted_zones_union,
+            flight_speed=flight_speed,
+            cost_inside_zone_per_second=cost_inside_zone_per_second,
+            cost_outside_zone_per_second=cost_outside_zone_per_second,
+            edge_cost_cache=shared_edge_cost_cache,
+        )
+        total_cost = path_cost(
+            optimized_path,
+            permitted_zones_union,
+            flight_speed=flight_speed,
+            cost_inside_zone_per_second=cost_inside_zone_per_second,
+            cost_outside_zone_per_second=cost_outside_zone_per_second,
+            edge_cost_cache=shared_edge_cost_cache,
+        )
+
+        if best_result is None:
+            best_result = (goal_index, goal, optimized_path, total_cost)
+            continue
+
+        _, _, best_path, best_cost = best_result
+        same_cost = math.isclose(total_cost, best_cost, rel_tol=1e-9, abs_tol=1e-9)
+        if total_cost < best_cost or (
+            same_cost and path_distance(optimized_path) < path_distance(best_path)
+        ):
+            best_result = (goal_index, goal, optimized_path, total_cost)
+
+    return best_result
+
+
+def simplify_path(
+    path,
+    permitted_zones_union=None,
+    flight_speed=1.0,
+    cost_inside_zone_per_second=1.0,
+    cost_outside_zone_per_second=12.0,
+    edge_cost_cache=None,
+    shortcut_cost_tolerance=0.1,
+    tol=1e-9,
+):
+    base_path = _simplify_collinear_path(path, tol=tol)
+    if permitted_zones_union is None or not base_path or len(base_path) < 3:
+        return base_path
+
+    prefix_costs = [0.0]
+    for i in range(1, len(base_path)):
+        prefix_costs.append(
+            prefix_costs[-1]
+            + edge_cost(
+                base_path[i - 1],
+                base_path[i],
+                permitted_zones_union,
+                flight_speed=flight_speed,
+                cost_inside_zone_per_second=cost_inside_zone_per_second,
+                cost_outside_zone_per_second=cost_outside_zone_per_second,
+                edge_cost_cache=edge_cost_cache,
+            )
+        )
+
+    optimized_path = [base_path[0]]
+    i = 0
+    while i < len(base_path) - 1:
+        best_next = i + 1
+        for j in range(len(base_path) - 1, i + 1, -1):
+            direct_cost = edge_cost(
+                base_path[i],
+                base_path[j],
+                permitted_zones_union,
+                flight_speed=flight_speed,
+                cost_inside_zone_per_second=cost_inside_zone_per_second,
+                cost_outside_zone_per_second=cost_outside_zone_per_second,
+                edge_cost_cache=edge_cost_cache,
+            )
+            original_cost = prefix_costs[j] - prefix_costs[i]
+            if direct_cost <= original_cost + shortcut_cost_tolerance:
+                best_next = j
+                break
+
+        optimized_path.append(base_path[best_next])
+        i = best_next
+
+    return _simplify_collinear_path(optimized_path, tol=tol)
 
 
 def plot_result(
@@ -862,136 +862,298 @@ def main():
     )
 
 
-import sys
+import logging
+import threading
 
-# import path_finder
-from PioneerControl import PioneerControl  # ИЗМЕНЕНИЕ
+from pioneer_sdk import Pioneer
 
-FLIGHT_ALTITUDE = 0.1  # Увеличим высоту для безопасности
-FLIGHT_SPEED = 2.0  # Скорость полета 1 м/с
-ZONE_PENALTY_PER_SECOND = 1.0
-OUTSIDE_PENALTY_PER_SECOND = 12.0
+MAX_FLIGHT_SPEED = 2.0
+SLOWDOWN_DISTANCE = 1.2
+MIN_APPROACH_SPEED = 0.6
 
 
-def fly_mission(pioneer: PioneerControl, waypoints: list):
-    print("Дрон подключен. Начинаем миссию.")
-    pioneer.arm()
-    pioneer.takeoff()
-
-    for i, point in enumerate(waypoints):
-        x, y = point
-        print(
-            f"\nОтправка на точку #{i + 1}: X={x:.2f}, Y={y:.2f} со скоростью {FLIGHT_SPEED} м/с"
+class PioneerControl:
+    def __init__(self, ip_addr, pioneer_port):
+        logging.basicConfig(
+            level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
         )
-        pioneer.set_point_with_speed(
-            target_x=x, target_y=y, target_z=FLIGHT_ALTITUDE, speed=FLIGHT_SPEED
-        )
+        self.logger = logging.getLogger(__name__)
 
-        while not pioneer.point_reached():
-            current_pos = pioneer.get_local_pose()
-            if current_pos:
-                print(
-                    f"\rТекущая позиция: X={current_pos[0]:.2f}, Y={current_pos[1]:.2f}, Z={current_pos[2]:.2f}",
-                    end="",
-                )
+        self.pioneer: Pioneer | None = None
+        self.target_speed = 0  # для управления скоростью в функции __compute_speed
+        self.low_distance = False
+
+        self.__current_pos: tuple[float, float, float] = (
+            0.0,
+            0.0,
+            0.0,
+        )  # последняя полученная позиция дрона
+        self.__command_pos: tuple[int] | None = None  # позиция для команды
+        self.__yaw: float = 0.0  # рысканье
+        self.__yaw_rate: float = 0.0  # скорость поворота рысканья
+        self.__speed: tuple[float, float, float] = (
+            0.0,
+            0.0,
+            0.0,
+        )  # задание скоростей по x, y, z
+        self.__coords_system: str = (
+            "GLOBAL_COORDS"  # GLOBAL_COORDS / SPEED / SPEED_FIXED / SPEED_POINT
+        )
+        self.__armed: bool = False
+        self.__takeoffed: bool = False
+        self.__target_yaw: int | None = None
+
+        self.__connect(ip_addr=str(ip_addr), port=int(pioneer_port))
+
+        # --- Изменения для корректного завершения ---
+        self.__stop_event = threading.Event()
+        self.__command_thread = threading.Thread(
+            target=self.__command_loop, daemon=True
+        )
+        self.__command_thread.start()
+
+    def __command_loop(self):
+        self.logger.info("Command loop started")
+        prev_cmd = None
+        # --- Цикл теперь проверяет событие остановки ---
+        while not self.__stop_event.is_set():
+            if not self.pioneer.connected():
+                self.logger.error("PIONEER NOT CONNECTED")
+                time.sleep(1)  # Пауза перед новой попыткой
+                continue
+
+            if self.__coords_system == "GLOBAL_COORDS":
+                if self.__command_pos is not None and self.__armed and self.__takeoffed:
+                    if prev_cmd != self.__command_pos:
+                        self.pioneer.go_to_local_point(
+                            x=self.__command_pos[0],
+                            y=self.__command_pos[1],
+                            z=self.__command_pos[2],
+                            yaw=self.__yaw,
+                        )
+                        self.logger.info(f"Command sent {self.__command_pos}")
+                        prev_cmd = self.__command_pos
+            elif self.__coords_system == "SPEED":
+                if self.__armed and self.__takeoffed:
+                    if prev_cmd != (*self.__speed, self.__yaw_rate):
+                        self.pioneer.set_manual_speed(
+                            vx=self.__speed[0],
+                            vy=self.__speed[1],
+                            vz=self.__speed[2],
+                            yaw_rate=self.__yaw_rate,
+                        )
+                        self.logger.info(
+                            f"Command sent {self.__speed}, yaw_rate: {self.__yaw_rate}"
+                        )
+                        prev_cmd = (*self.__speed, self.__yaw_rate)
+            elif self.__coords_system == "SPEED_FIXED":
+                if self.__armed and self.__takeoffed:
+                    if self.__target_yaw is not None and self.__is_yaw_reached():
+                        self.__target_yaw = None
+                        self.__yaw_rate = 0
+                    if prev_cmd != (*self.__speed, self.__yaw_rate):
+                        self.pioneer.set_manual_speed_body_fixed(
+                            vx=self.__speed[0],
+                            vy=self.__speed[1],
+                            vz=self.__speed[2],
+                            yaw_rate=self.__yaw_rate,
+                        )
+                        self.logger.info(
+                            f"Command sent {self.__speed}, yaw_rate: {self.__yaw_rate}"
+                        )
+                        prev_cmd = (*self.__speed, self.__yaw_rate)
+            elif self.__coords_system == "SPEED_POINT":
+                if self.__command_pos is not None:
+                    self.__speed = self.__compute_speed(
+                        *self.__command_pos, wanted_speed=self.target_speed
+                    )
+                if self.__armed and self.__takeoffed:
+                    self.pioneer.set_manual_speed_body_fixed(
+                        vx=self.__speed[0],
+                        vy=self.__speed[1],
+                        vz=self.__speed[2],
+                        yaw_rate=self.__yaw_rate,
+                    )
+
+            self.__update_position()
+            # self.__update_yaw()
             time.sleep(0.05)
+        self.logger.info("Command loop stopped.")
 
-        print(f"\nТочка #{i + 1} достигнута.")
-        time.sleep(0.05)
+    def stop(self):
+        """Останавливает поток управления и отключается от дрона."""
+        self.logger.info("Stopping...")
+        self.__stop_event.set()
+        self.__command_thread.join()  # Ожидаем завершения потока
+        if self.pioneer and self.pioneer.connected():
+            self.pioneer.close()  # Закрываем соединение
+            self.logger.info("Pioneer connection closed.")
 
-    print("\nВсе точки пройдены. Посадка...")
-    pioneer.land()
+    def __connect(self, ip_addr, port: str):
+        """Подключение к пионеру"""
+        try:
+            self.pioneer = Pioneer(ip=ip_addr, mavlink_port=port, logger=False)
+            if self.pioneer.connected():
+                self.logger.info("Pioneer connected!")
+            else:
+                self.logger.warning("Can't connect to Pioneer!")
+        except Exception as e:
+            self.logger.error(f"Failed to connect to Pioneer: {e}")
 
-    return True
+    def __is_yaw_reached(self, dead_zone: int = 10) -> bool:
+        if self.__coords_system == "SPEED_FIXED" and self.__target_yaw is not None:
+            return abs(math.degrees(self.__yaw) - self.__target_yaw) < dead_zone
+        return False
 
-
-def main():
-    if len(sys.argv) < 4:
-        print("Использование: python main.py <ip> <port> <zones_file>")
-        sys.exit(1)
-
-    ip = sys.argv[1]
-    port = int(sys.argv[2])
-    zones_file = sys.argv[3]
-
-    try:
-        with open(zones_file, "r", encoding="utf-8") as f:
-            text = f.read()
-        start, finishes, zones_pts = parse_data(text)
-        # start, finishes, zones_pts = path_finder.parse_data(text)
-    except FileNotFoundError:
-        print(f"Ошибка: Файл с зонами не найден по пути: {zones_file}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Ошибка при чтении или парсинге файла с зонами: {e}")
-        sys.exit(1)
-
-    res = 0.6
-
-    all_x = (
-        [start[0]]
-        + [finish[0] for finish in finishes]
-        + [x for poly in zones_pts for (x, y) in poly]
-    )
-    all_y = (
-        [start[1]]
-        + [finish[1] for finish in finishes]
-        + [y for poly in zones_pts for (x, y) in poly]
-    )
-    min_x, max_x = min(all_x) - 1.0, max(all_x) + 1.0
-    min_y, max_y = min(all_y) - 1.0, max(all_y) + 1.0
-
-    shapely_polys = [Polygon(poly) for poly in zones_pts if len(poly) >= 3]
-    permitted_zones_union = unary_union(shapely_polys) if shapely_polys else Polygon()
-
-    xs = np.arange(min_x, max_x + 1e-9, res)
-    ys = np.arange(min_y, max_y + 1e-9, res)
-    width, height = len(xs), len(ys)
-
-    print("Запускаем поиск лучшего пути A*...")
-    best_result = find_best_path(
-        start,
-        finishes,
-        min_x,
-        min_y,
-        res,
-        xs,
-        ys,
-        width,
-        height,
-        permitted_zones_union,
-        flight_speed=FLIGHT_SPEED,
-        cost_inside_zone_per_second=ZONE_PENALTY_PER_SECOND,
-        cost_outside_zone_per_second=OUTSIDE_PENALTY_PER_SECOND,
-    )
-
-    if best_result is None:
-        print("Путь не найден! Проверьте параметры или расположение зон.")
-        sys.exit(1)
-
-    finish_index, best_finish, path, total_penalty = best_result
-    simplified_path = simplify_path(path)
-
-    print(
-        f"Выбран финиш #{finish_index}: X={best_finish[0]:.3f}, Y={best_finish[1]:.3f}, "
-        f"ожидаемый штраф={total_penalty:.3f}"
-    )
-
-    print("\nУпрощённый путь (точки для дрона):")
-    for p in simplified_path:
-        print(f"X: {p[0]:.3f}, Y: {p[1]:.3f}")
-    pioneer_drone = PioneerControl(ip_addr=ip, pioneer_port=port)
-    time.sleep(0.3)
-
-    try:
-        success = fly_mission(pioneer_drone, simplified_path)
-        if success:
-            print("\nМиссия успешно завершена!")
+    def __is_point_reached(self, dead_zone: float = 0.7) -> bool:
+        """Проверка на расстояние до точки"""
+        if self.__command_pos is None:
+            return False
+        if self.__coords_system in ("GLOBAL_COORDS", "SPEED_POINT"):
+            if self.__current_pos:
+                distance = math.sqrt(
+                    (self.__current_pos[0] - self.__command_pos[0]) ** 2
+                    + (self.__current_pos[1] - self.__command_pos[1]) ** 2
+                    + (self.__current_pos[2] - self.__command_pos[2]) ** 2
+                )
+                return distance < dead_zone
+            return False
         else:
-            print("\nМиссия прервана из-за ошибки.")
-    except Exception as e:
-        print(f"\nПроизошла критическая ошибка во время полета: {e}")
+            self.logger.warning(
+                "Can't check if point is reached in current coordinate system"
+            )
+            return True
 
+    # def __update_yaw(self):
+    #     yaw = self.pioneer.get_yaw(get_last_received=True)
+    #     if yaw is not None:
+    #         self.__yaw = yaw
 
-if __name__ == "__main__":
-    main()
+    def __update_position(self):
+        pos = self.pioneer.get_local_position_lps(get_last_received=True)
+        if pos is not None:
+            self.__current_pos = pos
+
+    def __compute_speed(
+        self, target_x: float, target_y: float, target_z: float, wanted_speed: float
+    ) -> tuple[float, float, float]:
+        """Вычисляет скорость, с которой дрону нужно лететь по x, y, z чтобы добраться до точки"""
+        if self.__current_pos is None or self.__command_pos is None:
+            return 0.0, 0.0, 0.0
+
+        diff_x = target_x - self.__current_pos[0]
+        diff_y = target_y - self.__current_pos[1]
+        diff_z = target_z - self.__current_pos[2]
+
+        distance = math.sqrt(diff_x**2 + diff_y**2 + diff_z**2)
+
+        if distance < 0.05:  # Если мы уже в точке, скорость равна нулю
+            return 0.0, 0.0, 0.0
+
+        wanted_speed = max(0.0, min(float(wanted_speed), MAX_FLIGHT_SPEED))
+
+        # Плавное замедление при приближении к цели
+        current_speed = wanted_speed
+        if distance < SLOWDOWN_DISTANCE:
+            current_speed = max(
+                MIN_APPROACH_SPEED,
+                wanted_speed * (distance / SLOWDOWN_DISTANCE),
+            )
+
+        speed_scale = current_speed / distance
+        vx = diff_x * speed_scale
+        vy = diff_y * speed_scale
+        vz = diff_z * speed_scale
+
+        return vx, vy, vz
+
+    def point_reached(self):
+        if self.pioneer.connected():
+            return self.__is_point_reached()
+        else:
+            self.logger.error("PIONEER NOT CONNECTED FOR POINT REACHED")
+            return False
+
+    def set_local_pose(self, x, y, z, yaw=None):
+        """Ставит координаты для command_loop, yaw задается в градусах"""
+        self.__coords_system = "GLOBAL_COORDS"
+        self.__yaw_rate = 0.0
+        self.__speed = (0.0, 0.0, 0.0)
+        self.__command_pos = (x, y, z)
+        if yaw is not None:
+            self.__yaw = math.radians(yaw)
+        self.logger.info(f"Coords set: {self.__command_pos}, yaw: {self.__yaw}")
+
+    def set_speed(self, vx, vy, vz, yaw_rate=None):
+        """Устанавливает скорость в глобальной системе координат"""
+        self.__coords_system = "SPEED"
+        self.__command_pos = None
+        self.__speed = (vx, vy, vz)
+        if yaw_rate is not None:
+            self.__yaw_rate = math.radians(yaw_rate)
+        self.logger.info(f"Speed set: {self.__speed}, yaw rate: {self.__yaw_rate}")
+
+    def set_point_with_speed(self, target_x, target_y, target_z, speed):
+        """Лететь к точке с заданной скоростью в связанной с телом системе координат"""
+        self.__coords_system = "SPEED_POINT"
+        self.__command_pos = (target_x, target_y, target_z)
+        self.target_speed = speed
+
+    def set_speed_fixed(self, vx: float, vy: float, vz: float, yaw_rate=None):
+        """Устанавливает скорость в связанной с телом системе координат"""
+        self.__coords_system = "SPEED_FIXED"
+        self.__command_pos = None
+        self.__speed = (vx, vy, vz)
+        if yaw_rate is not None:
+            self.__yaw_rate = math.radians(yaw_rate)
+        self.logger.info(
+            f"<<FIXED>> Speed set: {self.__speed}, yaw rate: {self.__yaw_rate}"
+        )
+
+    def get_local_pose(self):
+        return self.__current_pos
+
+    def get_yaw(self, degrees=False):
+        return math.degrees(self.__yaw) if degrees else self.__yaw
+
+    def arm(self):
+        if self.pioneer.connected():
+            self.pioneer.arm()
+            self.__armed = True
+            self.logger.info("ARMED")
+        else:
+            self.logger.error("PIONEER NOT CONNECTED FOR ARM")
+
+    def takeoff(self):
+        if self.pioneer.connected():
+            self.pioneer.takeoff()
+            self.__takeoffed = True
+            self.logger.info("TAKEOFF")
+        else:
+            self.logger.error("PIONEER NOT CONNECTED FOR TAKEOFF")
+
+    def connection(self):
+        return self.pioneer and self.pioneer.connected()
+
+    def land(self):
+        if self.pioneer.connected():
+            if self.__takeoffed:
+                self.__command_pos = None
+                self.__speed = (0.0, 0.0, 0.0)
+                self.__yaw_rate = 0.0
+                self.pioneer.land()
+                self.__takeoffed = False
+                self.__armed = False
+                self.logger.info("LANDING")
+            else:
+                self.logger.warning("PIONEER NOT TAKEOFF FOR LANDING")
+        else:
+            self.logger.error("PIONEER NOT CONNECTED FOR LANDING")
+
+    def set_yaw(self, yaw, yaw_rate=30):
+        if self.__coords_system == "SPEED_FIXED":
+            self.__target_yaw = yaw
+            self.__yaw_rate = math.radians(
+                yaw_rate if self.get_yaw(degrees=True) < yaw else -yaw_rate
+            )
+            self.logger.info(f"Set yaw: {yaw} with rate: {yaw_rate}")
