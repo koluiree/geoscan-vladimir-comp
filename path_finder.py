@@ -13,25 +13,6 @@ except ModuleNotFoundError:
     MplPolygon = None
 
 
-def _edge_cache_key(
-    a,
-    b,
-    permitted_zones_union,
-    flight_speed,
-    cost_inside_zone_per_second,
-    cost_outside_zone_per_second,
-):
-    left, right = (a, b) if a <= b else (b, a)
-    return (
-        left,
-        right,
-        id(permitted_zones_union),
-        flight_speed,
-        cost_inside_zone_per_second,
-        cost_outside_zone_per_second,
-    )
-
-
 def _parse_point_line(line, label):
     parts = list(map(float, line.split()))
     if len(parts) != 2:
@@ -147,21 +128,7 @@ def edge_cost(
     flight_speed=1.0,
     cost_inside_zone_per_second=1.0,
     cost_outside_zone_per_second=12.0,
-    edge_cost_cache=None,
 ):
-    cache_key = None
-    if edge_cost_cache is not None:
-        cache_key = _edge_cache_key(
-            a,
-            b,
-            permitted_zones_union,
-            flight_speed,
-            cost_inside_zone_per_second,
-            cost_outside_zone_per_second,
-        )
-        if cache_key in edge_cost_cache:
-            return edge_cost_cache[cache_key]
-
     line = LineString([a, b])
     total_len = line.length
     if total_len == 0:
@@ -176,38 +143,9 @@ def edge_cost(
 
     time_in_zone = len_in_zone / flight_speed
     time_out_zone = len_out / flight_speed
-    cost = (
+    return (
         time_in_zone * cost_inside_zone_per_second
         + time_out_zone * cost_outside_zone_per_second
-    )
-
-    if cache_key is not None:
-        edge_cost_cache[cache_key] = cost
-
-    return cost
-
-
-def path_cost(
-    path,
-    permitted_zones_union,
-    flight_speed=1.0,
-    cost_inside_zone_per_second=1.0,
-    cost_outside_zone_per_second=12.0,
-    edge_cost_cache=None,
-):
-    if not path or len(path) < 2:
-        return 0.0
-    return sum(
-        edge_cost(
-            path[i - 1],
-            path[i],
-            permitted_zones_union,
-            flight_speed=flight_speed,
-            cost_inside_zone_per_second=cost_inside_zone_per_second,
-            cost_outside_zone_per_second=cost_outside_zone_per_second,
-            edge_cost_cache=edge_cost_cache,
-        )
-        for i in range(1, len(path))
     )
 
 
@@ -225,7 +163,6 @@ def astar_grid_with_cost(
     flight_speed=1.0,
     cost_inside_zone_per_second=1.0,
     cost_outside_zone_per_second=12.0,
-    edge_cost_cache=None,
 ):
     sx = (start[0] - min_x) / res
     sy = (start[1] - min_y) / res
@@ -253,7 +190,6 @@ def astar_grid_with_cost(
             flight_speed=flight_speed,
             cost_inside_zone_per_second=cost_inside_zone_per_second,
             cost_outside_zone_per_second=cost_outside_zone_per_second,
-            edge_cost_cache=edge_cost_cache,
         )
 
     min_penalty_per_second = min(
@@ -274,12 +210,10 @@ def astar_grid_with_cost(
         flight_speed=flight_speed,
         cost_inside_zone_per_second=cost_inside_zone_per_second,
         cost_outside_zone_per_second=cost_outside_zone_per_second,
-        edge_cost_cache=edge_cost_cache,
     )
     heapq.heappush(open_heap, (start_cost + heuristic(start_coord), start_idx))
     g_score = {start_idx: start_cost}
     came_from = {}
-    closed_nodes = set()
 
     neighbor_offsets = [
         (-1, -1),
@@ -294,16 +228,6 @@ def astar_grid_with_cost(
 
     while open_heap:
         f, current = heapq.heappop(open_heap)
-        if current in closed_nodes:
-            continue
-
-        current_coord = grid_index_to_coord(current[0], current[1], min_x, min_y, res)
-        expected_f = g_score[current] + heuristic(current_coord)
-        if f > expected_f + 1e-9:
-            continue
-
-        closed_nodes.add(current)
-
         if current == goal_idx:
             path = []
             cur = current
@@ -331,16 +255,12 @@ def astar_grid_with_cost(
                 flight_speed=flight_speed,
                 cost_inside_zone_per_second=cost_inside_zone_per_second,
                 cost_outside_zone_per_second=cost_outside_zone_per_second,
-                edge_cost_cache=edge_cost_cache,
             )
             return path, total_cost
 
         for dx, dy in neighbor_offsets:
             nx, ny = current[0] + dx, current[1] + dy
             if not in_bounds(nx, ny):
-                continue
-            neighbor = (nx, ny)
-            if neighbor in closed_nodes:
                 continue
             a = grid_index_to_coord(current[0], current[1], min_x, min_y, res)
             b = grid_index_to_coord(nx, ny, min_x, min_y, res)
@@ -351,8 +271,8 @@ def astar_grid_with_cost(
                 flight_speed=flight_speed,
                 cost_inside_zone_per_second=cost_inside_zone_per_second,
                 cost_outside_zone_per_second=cost_outside_zone_per_second,
-                edge_cost_cache=edge_cost_cache,
             )
+            neighbor = (nx, ny)
             if neighbor not in g_score or tentative_g < g_score[neighbor]:
                 g_score[neighbor] = tentative_g
                 nb_coord = grid_index_to_coord(nx, ny, min_x, min_y, res)
@@ -377,7 +297,6 @@ def astar_grid(
     flight_speed=1.0,
     cost_inside_zone_per_second=1.0,
     cost_outside_zone_per_second=12.0,
-    edge_cost_cache=None,
 ):
     path, _ = astar_grid_with_cost(
         start,
@@ -393,7 +312,6 @@ def astar_grid(
         flight_speed=flight_speed,
         cost_inside_zone_per_second=cost_inside_zone_per_second,
         cost_outside_zone_per_second=cost_outside_zone_per_second,
-        edge_cost_cache=edge_cost_cache,
     )
     return path
 
@@ -407,7 +325,57 @@ def path_distance(path):
     )
 
 
-def _simplify_collinear_path(path, tol=1e-9):
+def find_best_path(
+    start,
+    goals,
+    min_x,
+    min_y,
+    res,
+    xs,
+    ys,
+    width,
+    height,
+    permitted_zones_union,
+    flight_speed=1.0,
+    cost_inside_zone_per_second=1.0,
+    cost_outside_zone_per_second=12.0,
+):
+    best_result = None
+
+    for goal_index, goal in enumerate(goals, start=1):
+        path, total_cost = astar_grid_with_cost(
+            start,
+            goal,
+            min_x,
+            min_y,
+            res,
+            xs,
+            ys,
+            width,
+            height,
+            permitted_zones_union,
+            flight_speed=flight_speed,
+            cost_inside_zone_per_second=cost_inside_zone_per_second,
+            cost_outside_zone_per_second=cost_outside_zone_per_second,
+        )
+        if path is None:
+            continue
+
+        if best_result is None:
+            best_result = (goal_index, goal, path, total_cost)
+            continue
+
+        _, _, best_path, best_cost = best_result
+        same_cost = math.isclose(total_cost, best_cost, rel_tol=1e-9, abs_tol=1e-9)
+        if total_cost < best_cost or (
+            same_cost and path_distance(path) < path_distance(best_path)
+        ):
+            best_result = (goal_index, goal, path, total_cost)
+
+    return best_result
+
+
+def simplify_path(path, tol=1e-9):
     if not path or len(path) < 3:
         return path[:]
 
@@ -437,133 +405,6 @@ def _simplify_collinear_path(path, tol=1e-9):
         simplified.append(path[-1])
 
     return simplified
-
-
-def find_best_path(
-    start,
-    goals,
-    min_x,
-    min_y,
-    res,
-    xs,
-    ys,
-    width,
-    height,
-    permitted_zones_union,
-    flight_speed=1.0,
-    cost_inside_zone_per_second=1.0,
-    cost_outside_zone_per_second=12.0,
-):
-    best_result = None
-    shared_edge_cost_cache = {}
-
-    for goal_index, goal in enumerate(goals, start=1):
-        path, _ = astar_grid_with_cost(
-            start,
-            goal,
-            min_x,
-            min_y,
-            res,
-            xs,
-            ys,
-            width,
-            height,
-            permitted_zones_union,
-            flight_speed=flight_speed,
-            cost_inside_zone_per_second=cost_inside_zone_per_second,
-            cost_outside_zone_per_second=cost_outside_zone_per_second,
-            edge_cost_cache=shared_edge_cost_cache,
-        )
-        if path is None:
-            continue
-
-        optimized_path = simplify_path(
-            path,
-            permitted_zones_union=permitted_zones_union,
-            flight_speed=flight_speed,
-            cost_inside_zone_per_second=cost_inside_zone_per_second,
-            cost_outside_zone_per_second=cost_outside_zone_per_second,
-            edge_cost_cache=shared_edge_cost_cache,
-        )
-        total_cost = path_cost(
-            optimized_path,
-            permitted_zones_union,
-            flight_speed=flight_speed,
-            cost_inside_zone_per_second=cost_inside_zone_per_second,
-            cost_outside_zone_per_second=cost_outside_zone_per_second,
-            edge_cost_cache=shared_edge_cost_cache,
-        )
-
-        if best_result is None:
-            best_result = (goal_index, goal, optimized_path, total_cost)
-            continue
-
-        _, _, best_path, best_cost = best_result
-        same_cost = math.isclose(total_cost, best_cost, rel_tol=1e-9, abs_tol=1e-9)
-        if total_cost < best_cost or (
-            same_cost and path_distance(optimized_path) < path_distance(best_path)
-        ):
-            best_result = (goal_index, goal, optimized_path, total_cost)
-
-    return best_result
-
-
-def simplify_path(
-    path,
-    permitted_zones_union=None,
-    flight_speed=1.0,
-    cost_inside_zone_per_second=1.0,
-    cost_outside_zone_per_second=12.0,
-    edge_cost_cache=None,
-    shortcut_cost_tolerance=0.1,
-    tol=1e-9,
-):
-    base_path = _simplify_collinear_path(path, tol=tol)
-    if (
-        permitted_zones_union is None
-        or not base_path
-        or len(base_path) < 3
-    ):
-        return base_path
-
-    prefix_costs = [0.0]
-    for i in range(1, len(base_path)):
-        prefix_costs.append(
-            prefix_costs[-1]
-            + edge_cost(
-                base_path[i - 1],
-                base_path[i],
-                permitted_zones_union,
-                flight_speed=flight_speed,
-                cost_inside_zone_per_second=cost_inside_zone_per_second,
-                cost_outside_zone_per_second=cost_outside_zone_per_second,
-                edge_cost_cache=edge_cost_cache,
-            )
-        )
-
-    optimized_path = [base_path[0]]
-    i = 0
-    while i < len(base_path) - 1:
-        best_next = i + 1
-        for j in range(len(base_path) - 1, i + 1, -1):
-            direct_cost = edge_cost(
-                base_path[i],
-                base_path[j],
-                permitted_zones_union,
-                flight_speed=flight_speed,
-                cost_inside_zone_per_second=cost_inside_zone_per_second,
-                cost_outside_zone_per_second=cost_outside_zone_per_second,
-                edge_cost_cache=edge_cost_cache,
-            )
-            original_cost = prefix_costs[j] - prefix_costs[i]
-            if direct_cost <= original_cost + shortcut_cost_tolerance:
-                best_next = j
-                break
-
-        optimized_path.append(base_path[best_next])
-        i = best_next
-
-    return _simplify_collinear_path(optimized_path, tol=tol)
 
 
 def plot_result(

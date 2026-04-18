@@ -8,10 +8,9 @@ from shapely.geometry import Polygon
 from shapely.ops import unary_union
 
 FLIGHT_ALTITUDE = 0.1  # Увеличим высоту для безопасности
-FLIGHT_SPEED = 2.0
+FLIGHT_SPEED = 2.0     # Скорость полета 1 м/с
 ZONE_PENALTY_PER_SECOND = 1.0
 OUTSIDE_PENALTY_PER_SECOND = 12.0
-ZONE_FULL_CROSS_MARGIN = 0.25
 
 def fly_mission(pioneer: PioneerControl, waypoints: list):
     print("Дрон подключен. Начинаем миссию.")
@@ -71,11 +70,6 @@ def main():
 
     shapely_polys = [Polygon(poly) for poly in zones_pts if len(poly) >= 3]
     permitted_zones_union = unary_union(shapely_polys) if shapely_polys else Polygon()
-    effective_permitted_zones_union = (
-        permitted_zones_union.buffer(ZONE_FULL_CROSS_MARGIN, join_style=2)
-        if ZONE_FULL_CROSS_MARGIN > 0
-        else permitted_zones_union
-    )
 
     xs = np.arange(min_x, max_x + 1e-9, res)
     ys = np.arange(min_y, max_y + 1e-9, res)
@@ -92,7 +86,7 @@ def main():
         ys,
         width,
         height,
-        effective_permitted_zones_union,
+        permitted_zones_union,
         flight_speed=FLIGHT_SPEED,
         cost_inside_zone_per_second=ZONE_PENALTY_PER_SECOND,
         cost_outside_zone_per_second=OUTSIDE_PENALTY_PER_SECOND,
@@ -102,21 +96,22 @@ def main():
         print("Путь не найден! Проверьте параметры или расположение зон.")
         sys.exit(1)
 
-    finish_index, best_finish, optimized_path, total_penalty = best_result
+    finish_index, best_finish, path, total_penalty = best_result
+    simplified_path = path_finder.simplify_path(path)
 
     print(
         f"Выбран финиш #{finish_index}: X={best_finish[0]:.3f}, Y={best_finish[1]:.3f}, "
         f"ожидаемый штраф={total_penalty:.3f}"
     )
     
-    print("\nОптимизированный путь (точки для дрона):")
-    for p in optimized_path:
+    print("\nУпрощённый путь (точки для дрона):")
+    for p in simplified_path:
         print(f"X: {p[0]:.3f}, Y: {p[1]:.3f}")
     pioneer_drone = PioneerControl(ip_addr=ip, pioneer_port=port)
     time.sleep(0.3)
 
     try:
-        success = fly_mission(pioneer_drone, optimized_path)
+        success = fly_mission(pioneer_drone, simplified_path)
         if success:
             print("\nМиссия успешно завершена!")
         else:
