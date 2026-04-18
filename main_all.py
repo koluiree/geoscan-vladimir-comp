@@ -864,27 +864,163 @@ def main():
 
 import sys
 
-# import path_finder
-from PioneerControl import PioneerControl  # ИЗМЕНЕНИЕ
-
 FLIGHT_ALTITUDE = 0.1  # Увеличим высоту для безопасности
 FLIGHT_SPEED = 2.0  # Скорость полета 1 м/с
 ZONE_PENALTY_PER_SECOND = 1.0
 OUTSIDE_PENALTY_PER_SECOND = 12.0
+MIN_CRUISE_ALTITUDE = 0.8
+DESCENT_START_RATIO = 0.2
+LAND_BEFORE_FINISH_DISTANCE = 1.0
+TAKEOFF_ALTITUDE_WAIT_TIME = 2.5
 
 
-def fly_mission(pioneer: PioneerControl, waypoints: list):
+def path_length(points: list[tuple[float, float]]) -> float:
+    if len(points) < 2:
+        return 0.0
+    return sum(
+        math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1])
+        for i in range(1, len(points))
+    )
+
+
+def interpolate_xy(
+    a: tuple[float, float], b: tuple[float, float], ratio: float
+) -> tuple[float, float]:
+    return (
+        a[0] + (b[0] - a[0]) * ratio,
+        a[1] + (b[1] - a[1]) * ratio,
+    )
+
+
+def build_early_landing_path(
+    path: list[tuple[float, float]],
+    finish_center: tuple[float, float],
+    stop_before_center: float,
+) -> list[tuple[float, float]]:
+    if len(path) < 2 or stop_before_center <= 0:
+        return path[:]
+
+    prev_point = path[-2]
+    segment_length = math.hypot(
+        finish_center[0] - prev_point[0], finish_center[1] - prev_point[1]
+    )
+    if segment_length <= 1e-9:
+        return path[:]
+
+    offset = min(stop_before_center, max(segment_length - 0.1, 0.0))
+    if offset <= 1e-9:
+        return path[:]
+
+    landing_ratio = (segment_length - offset) / segment_length
+    early_landing_point = interpolate_xy(prev_point, finish_center, landing_ratio)
+    return path[:-1] + [early_landing_point]
+
+
+def wait_for_cruise_altitude(pioneer: PioneerControl) -> float:
+    deadline = time.time() + TAKEOFF_ALTITUDE_WAIT_TIME
+    max_observed_altitude = None
+
+    while time.time() < deadline:
+        current_pos = pioneer.get_local_pose()
+        if current_pos is not None:
+            current_altitude = current_pos[2]
+            if max_observed_altitude is None:
+                max_observed_altitude = current_altitude
+            else:
+                max_observed_altitude = max(max_observed_altitude, current_altitude)
+        time.sleep(0.05)
+
+    if max_observed_altitude is None:
+        return max(MIN_CRUISE_ALTITUDE, FLIGHT_ALTITUDE)
+    return max(max_observed_altitude, MIN_CRUISE_ALTITUDE, FLIGHT_ALTITUDE)
+
+
+def build_descent_waypoints(
+    path: list[tuple[float, float]],
+    cruise_altitude: float,
+    final_altitude: float,
+    descent_start_ratio: float,
+) -> list[tuple[float, float, float]]:
+    if not path:
+        return []
+    if len(path) == 1:
+        x, y = path[0]
+        return [(x, y, final_altitude)]
+
+    total_distance = path_length(path)
+    if total_distance <= 1e-9:
+        x, y = path[-1]
+        return [(x, y, final_altitude)]
+
+    descent_start_distance = total_distance * max(0.0, min(descent_start_ratio, 1.0))
+
+    points_with_distance = [(path[0], 0.0)]
+    traversed_distance = 0.0
+    inserted_descent_start = False
+
+    for i in range(1, len(path)):
+        prev_point = path[i - 1]
+        current_point = path[i]
+        segment_length = math.hypot(
+            current_point[0] - prev_point[0], current_point[1] - prev_point[1]
+        )
+
+        if (
+            not inserted_descent_start
+            and segment_length > 1e-9
+            and traversed_distance + 1e-9 < descent_start_distance
+            and descent_start_distance < traversed_distance + segment_length - 1e-9
+        ):
+            ratio = (descent_start_distance - traversed_distance) / segment_length
+            descent_start_point = interpolate_xy(prev_point, current_point, ratio)
+            points_with_distance.append((descent_start_point, descent_start_distance))
+            inserted_descent_start = True
+
+        traversed_distance += segment_length
+        points_with_distance.append((current_point, traversed_distance))
+
+    mission_waypoints = []
+    descent_distance = max(total_distance - descent_start_distance, 1e-9)
+
+    for point, distance_from_start in points_with_distance[1:]:
+        if distance_from_start <= descent_start_distance + 1e-9:
+            altitude = cruise_altitude
+        else:
+            descent_progress = (
+                distance_from_start - descent_start_distance
+            ) / descent_distance
+            altitude = (
+                cruise_altitude + (final_altitude - cruise_altitude) * descent_progress
+            )
+        mission_waypoints.append((point[0], point[1], altitude))
+
+    return mission_waypoints
+
+
+def fly_mission(pioneer: PioneerControl, path_points: list[tuple[float, float]]):
     print("Дрон подключен. Начинаем миссию.")
     pioneer.arm()
     pioneer.takeoff()
 
+    cruise_altitude = wait_for_cruise_altitude(pioneer)
+    waypoints = build_descent_waypoints(
+        path_points,
+        cruise_altitude=cruise_altitude,
+        final_altitude=FLIGHT_ALTITUDE,
+        descent_start_ratio=DESCENT_START_RATIO,
+    )
+
     for i, point in enumerate(waypoints):
-        x, y = point
+        x, y, z = point
         print(
-            f"\nОтправка на точку #{i + 1}: X={x:.2f}, Y={y:.2f} со скоростью {FLIGHT_SPEED} м/с"
+            f"\nОтправка на точку #{i + 1}: "
+            f"X={x:.2f}, Y={y:.2f}, Z={z:.2f} со скоростью {FLIGHT_SPEED} м/с"
         )
         pioneer.set_point_with_speed(
-            target_x=x, target_y=y, target_z=FLIGHT_ALTITUDE, speed=FLIGHT_SPEED
+            target_x=x,
+            target_y=y,
+            target_z=z,
+            speed=FLIGHT_SPEED,
         )
 
         while not pioneer.point_reached():
@@ -918,7 +1054,6 @@ def main():
         with open(zones_file, "r", encoding="utf-8") as f:
             text = f.read()
         start, finishes, zones_pts = parse_data(text)
-        # start, finishes, zones_pts = path_finder.parse_data(text)
     except FileNotFoundError:
         print(f"Ошибка: Файл с зонами не найден по пути: {zones_file}")
         sys.exit(1)
@@ -971,20 +1106,31 @@ def main():
 
     finish_index, best_finish, path, total_penalty = best_result
     simplified_path = simplify_path(path)
+    mission_path = build_early_landing_path(
+        simplified_path,
+        finish_center=best_finish,
+        stop_before_center=LAND_BEFORE_FINISH_DISTANCE,
+    )
 
     print(
         f"Выбран финиш #{finish_index}: X={best_finish[0]:.3f}, Y={best_finish[1]:.3f}, "
         f"ожидаемый штраф={total_penalty:.3f}"
     )
 
+    if mission_path[-1] != best_finish:
+        print(
+            f"Точка посадки смещена раньше центра финиша: "
+            f"X={mission_path[-1][0]:.3f}, Y={mission_path[-1][1]:.3f}"
+        )
+
     print("\nУпрощённый путь (точки для дрона):")
-    for p in simplified_path:
+    for p in mission_path:
         print(f"X: {p[0]:.3f}, Y: {p[1]:.3f}")
     pioneer_drone = PioneerControl(ip_addr=ip, pioneer_port=port)
     time.sleep(0.3)
 
     try:
-        success = fly_mission(pioneer_drone, simplified_path)
+        success = fly_mission(pioneer_drone, mission_path)
         if success:
             print("\nМиссия успешно завершена!")
         else:
